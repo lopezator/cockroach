@@ -40,7 +40,7 @@ func validateTable(
 	if catalog.IsSystemDescriptor(tableDesc) {
 		return errors.Errorf(`CHANGEFEEDs are not supported on system tables`)
 	}
-	if tableDesc.IsView() {
+	if tableDesc.IsView() && !tableDesc.MaterializedView() {
 		return errors.Errorf(`CHANGEFEED cannot target views: %s`, tableDesc.GetName())
 	}
 	if tableDesc.IsVirtualTable() {

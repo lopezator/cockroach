@@ -274,6 +274,99 @@ AS SELECT *, event_op() AS op  FROM foo`)
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
+func TestChangefeedMaterializedView(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	waitForCommit, waitToProceed, refreshDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	sessionOverride := withKnobsFn(func(knobs *base.TestingKnobs) {
+		// This is a hack to avoid the job adoption loop from
+		// immediately re-adopting the job that is running. The job
+		// adoption loop basically just sets the claim ID, which will
+		// undo our deletion of the claim ID below.
+		knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
+			RunBeforeMaterializedViewRefreshCommit: func() error {
+				close(waitForCommit)
+				<-waitToProceed
+				return nil
+			},
+		}
+	})
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE fruits (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE tastes (id INT PRIMARY KEY, name STRING, fruit_id INT)`)
+		sqlDB.Exec(t, `INSERT INTO fruits VALUES (0, 'pomegranate')`)
+		sqlDB.Exec(t, `INSERT INTO tastes VALUES (0, 'sour', 0)`)
+		sqlDB.Exec(t, `CREATE MATERIALIZED VIEW fruits_tastes AS select fruits.id, fruits.name, tastes.name AS taste FROM fruits JOIN tastes ON fruits.id = tastes.fruit_id`)
+		//sqlDB.Exec(t, `REFRESH MATERIALIZED VIEW fruits_tastes`)
+		foo := feed(t, f, `CREATE CHANGEFEED FOR fruits_tastes`)
+		defer closeFeed(t, foo)
+
+		var rowid int
+		sqlDB.QueryRow(t, `SELECT rowid from fruits_tastes`).Scan(&rowid)
+
+		assertPayloads(t, foo, []string{
+			fmt.Sprintf(`fruits_tastes: [%d]->{"after": {"id": 0, "name": "pomegranate", "rowid": %d, "taste": "sour"}}`, rowid, rowid),
+		})
+
+		t.Log("llega0")
+
+		// Start a refresh.
+		go func() {
+			t.Log("llega1")
+			sqlDB.Exec(t, `REFRESH MATERIALIZED VIEW fruits_tastes`)
+			close(refreshDone)
+		}()
+
+		<-waitForCommit
+
+		t.Log("llega2")
+		// Let the refresh commit.
+		close(waitToProceed)
+		<-refreshDone
+		t.Log("llega3")
+
+		//sqlDB.Exec(t, `UPSERT INTO fruits VALUES (0, 'lala')`)
+		//sqlDB.Exec(t, `UPSERT INTO tastes VALUES (0, 'sweet', 0)`)
+		//
+		assertPayloads(t, foo, []string{
+			fmt.Sprintf(`fruits_tastes: [%d]->{"after": {"id": 0, "name": "lala", "rowid": %d, "taste": "sweet"}}`, rowid, rowid),
+		})
+
+		//sqlDB.Exec(t, `INSERT INTO fruits VALUES (1, 'persimmon'), (2, 'custard apple')`)
+		//assertPayloads(t, foo, []string{
+		//	`fruits_tastes: [1]->{"after": {"id": 1, "name": "persimmon"}}`,
+		//	`fruits_tastes: [2]->{"after": {"id": 2, "name": "custard apple"}}`,
+		//})
+		//
+		//sqlDB.Exec(t, `INSERT INTO tastes VALUES (1, 'sweet', 1), (2, 'sweet', 2)`)
+		//assertPayloads(t, foo, []string{
+		//	`fruits_tastes: [1]->{"after": {"id": 1, "name": "sweet", "fruit_id", 1}}`,
+		//	`fruits_tastes: [2]->{"after": {"id": 2, "name": "custard apple", "fruit_id", 2}}`,
+		//})
+		//
+		//sqlDB.Exec(t, `UPSERT INTO fruits VALUES (2, 'melon'), (3, 'watermelon')`)
+		//assertPayloads(t, foo, []string{
+		//	`fruits_tastes: [2]->{"after": {"id": 2, "name": "melon"}}`,
+		//	`fruits_tastes: [3]->{"after": {"id": 3, "name": "watermelon"}}`,
+		//})
+		//
+		//sqlDB.Exec(t, `INSERT INTO tastes VALUES (3, 'sweet', 3)`)
+		//assertPayloads(t, foo, []string{
+		//	`fruits_tastes: [1]->{"after": {"id": 3, "name": "sweet", "fruit_id", 3}}`,
+		//})
+		//
+		//sqlDB.Exec(t, `DELETE FROM foo WHERE a = 1`)
+		//assertPayloads(t, foo, []string{
+		//	`fruits_tastes: [1]->{"after": null}`,
+		//})
+	}
+
+	cdcTest(t, testFn, sessionOverride)
+}
+
 func TestToJSONAsChangefeed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
